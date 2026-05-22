@@ -3,269 +3,177 @@
 
   const { state } = window.BentoState;
 
-  function clone(value) {
-    return JSON.parse(JSON.stringify(value));
-  }
+  const JSONP_TIMEOUT_MS = 30000;
+  const STATUS_CODES = ["ACTIVE", "CHANGED", "CANCELED", "REJECTED"];
+  let requestSequence = 0;
 
-  function mockDelay(result) {
-    return new Promise((resolve) => {
-      window.setTimeout(() => resolve(clone(result)), 220);
-    });
-  }
+  function getApiBaseUrl() {
+    const config = window.APP_CONFIG || {};
+    const apiBaseUrl = String(config.API_BASE_URL || "").trim();
 
-  function nowLocalString() {
-    const date = new Date();
-    const pad = (value) => String(value).padStart(2, "0");
-    return [
-      date.getFullYear(),
-      pad(date.getMonth() + 1),
-      pad(date.getDate())
-    ].join("-") + " " + [pad(date.getHours()), pad(date.getMinutes())].join(":");
-  }
-
-  function randomCode() {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let code = "";
-    for (let index = 0; index < 4; index += 1) {
-      code += chars[Math.floor(Math.random() * chars.length)];
+    if (!apiBaseUrl) {
+      throw new Error("APP_CONFIG.API_BASE_URL is not configured.");
     }
-    return code;
+
+    return apiBaseUrl;
   }
 
-  function generateMockOrderId(deliveryDate) {
-    // 本番ではGAS側で注文IDを発行する想定です。これはフロント側モック専用です。
-    const ymd = String(deliveryDate || "").replaceAll("-", "");
-    return `ORDER-${ymd}-${randomCode()}`;
+  function buildJsonpUrl(action, payload, callbackName) {
+    const params = new URLSearchParams();
+    params.set("action", action);
+    params.set("callback", callbackName);
+    params.set("_", String(Date.now()));
+
+    if (payload !== undefined) {
+      params.set("payload", JSON.stringify(payload));
+    }
+
+    const apiBaseUrl = getApiBaseUrl();
+    const separator = apiBaseUrl.includes("?") ? "&" : "?";
+    return `${apiBaseUrl}${separator}${params.toString()}`;
   }
 
-  function createInitialOrders() {
-    return [
-      {
-        orderId: "ORDER-20260525-A1B2",
-        acceptedAt: "2026-05-22 09:00",
-        deliveryDate: "2026-05-25",
-        department: "総務課",
-        applicantName: "田中",
-        menuId: "B001",
-        menuName: "鮭弁当",
-        unitPrice: 750,
-        quantity: 3,
-        subtotal: 2250,
-        status: "ACTIVE",
-        previousOrderId: "",
-        updatedAt: "2026-05-22 09:00"
-      },
-      {
-        orderId: "ORDER-20260525-C3D4",
-        acceptedAt: "2026-05-22 09:05",
-        deliveryDate: "2026-05-25",
-        department: "総務課",
-        applicantName: "田中",
-        menuId: "B002",
-        menuName: "のり弁当",
-        unitPrice: 650,
-        quantity: 2,
-        subtotal: 1300,
-        status: "ACTIVE",
-        previousOrderId: "",
-        updatedAt: "2026-05-22 09:05"
-      },
-      {
-        orderId: "ORDER-20260525-E5F6",
-        acceptedAt: "2026-05-22 09:10",
-        deliveryDate: "2026-05-25",
-        department: "議事課",
-        applicantName: "佐藤",
-        menuId: "B004",
-        menuName: "カレー",
-        unitPrice: 650,
-        quantity: 1,
-        subtotal: 650,
-        status: "CANCELED",
-        previousOrderId: "",
-        updatedAt: "2026-05-22 10:15"
+  function cleanupJsonpRequest(script, callbackName, timeoutId) {
+    window.clearTimeout(timeoutId);
+
+    if (script.parentNode) {
+      script.parentNode.removeChild(script);
+    }
+
+    try {
+      delete window[callbackName];
+    } catch (error) {
+      window[callbackName] = undefined;
+    }
+  }
+
+  function unwrapApiResponse(response) {
+    if (!response || response.ok !== true) {
+      const message =
+        response && response.error
+          ? String(response.error)
+          : "GAS API returned an invalid response.";
+      throw new Error(message);
+    }
+
+    return response.data;
+  }
+
+  function callGasApi(action, payload) {
+    return new Promise((resolve, reject) => {
+      const callbackName = `BentoApiJsonp_${Date.now()}_${requestSequence += 1}`;
+      const script = document.createElement("script");
+      let settled = false;
+      let timeoutId;
+
+      function settle(callback) {
+        if (settled) return;
+        settled = true;
+        cleanupJsonpRequest(script, callbackName, timeoutId);
+        callback();
       }
-    ];
-  }
 
-  function buildSummaries(orders) {
-    const activeOrders = orders.filter((order) => order.status === "ACTIVE");
-    const departmentMap = new Map();
-    const menuMap = new Map();
-
-    activeOrders.forEach((order) => {
-      const departmentKey = [
-        order.deliveryDate,
-        order.department,
-        order.menuId
-      ].join("|");
-      const menuKey = [order.deliveryDate, order.menuId].join("|");
-
-      if (!departmentMap.has(departmentKey)) {
-        departmentMap.set(departmentKey, {
-          deliveryDate: order.deliveryDate,
-          department: order.department,
-          menuId: order.menuId,
-          menuName: order.menuName,
-          unitPrice: order.unitPrice,
-          totalQuantity: 0,
-          totalAmount: 0
+      window[callbackName] = (response) => {
+        settle(() => {
+          try {
+            resolve(unwrapApiResponse(response));
+          } catch (error) {
+            reject(error);
+          }
         });
-      }
+      };
 
-      if (!menuMap.has(menuKey)) {
-        menuMap.set(menuKey, {
-          deliveryDate: order.deliveryDate,
-          menuId: order.menuId,
-          menuName: order.menuName,
-          unitPrice: order.unitPrice,
-          totalQuantity: 0,
-          totalAmount: 0
-        });
-      }
+      script.async = true;
+      script.src = buildJsonpUrl(action, payload, callbackName);
+      script.onerror = () => {
+        settle(() => reject(new Error("Failed to load GAS API JSONP response.")));
+      };
 
-      const departmentSummary = departmentMap.get(departmentKey);
-      departmentSummary.totalQuantity += order.quantity;
-      departmentSummary.totalAmount += order.subtotal;
+      timeoutId = window.setTimeout(() => {
+        settle(() => reject(new Error("GAS API request timed out.")));
+      }, JSONP_TIMEOUT_MS);
 
-      const menuSummary = menuMap.get(menuKey);
-      menuSummary.totalQuantity += order.quantity;
-      menuSummary.totalAmount += order.subtotal;
+      document.head.appendChild(script);
     });
-
-    const byDepartment = [...departmentMap.values()].sort((a, b) =>
-      `${a.deliveryDate}${a.department}${a.menuId}`.localeCompare(
-        `${b.deliveryDate}${b.department}${b.menuId}`,
-        "ja"
-      )
-    );
-
-    const byMenu = [...menuMap.values()].sort((a, b) =>
-      `${a.deliveryDate}${a.menuId}`.localeCompare(`${b.deliveryDate}${b.menuId}`, "ja")
-    );
-
-    return { byDepartment, byMenu };
   }
 
-  function refreshSummaries() {
-    state.summaries = buildSummaries(state.orders);
+  function normalizeSummaries(summaries) {
+    const source = summaries || {};
+
+    return {
+      byDepartment: Array.isArray(source.byDepartment)
+        ? source.byDepartment
+        : Array.isArray(source.department)
+          ? source.department
+          : [],
+      byMenu: Array.isArray(source.byMenu)
+        ? source.byMenu
+        : Array.isArray(source.total)
+          ? source.total
+          : []
+    };
+  }
+
+  function normalizeStatus(status) {
+    const value = String(status || "").trim();
+    if (STATUS_CODES.includes(value)) return value;
+
+    const statusLabel =
+      window.BentoFormatters && typeof window.BentoFormatters.statusLabel === "function"
+        ? window.BentoFormatters.statusLabel
+        : null;
+    const matchedStatus = statusLabel
+      ? STATUS_CODES.find((statusCode) => statusLabel(statusCode) === value)
+      : "";
+
+    return matchedStatus || value || "UNKNOWN";
+  }
+
+  function normalizeOrders(orders) {
+    if (!Array.isArray(orders)) return [];
+
+    return orders.map((order) => ({
+      ...order,
+      status: normalizeStatus(order && order.status)
+    }));
+  }
+
+  function normalizeInitialData(data) {
+    const source = data || {};
+
+    return {
+      menus: Array.isArray(source.menus) ? source.menus : state.menus,
+      deliveryDates: Array.isArray(source.deliveryDates)
+        ? source.deliveryDates
+        : state.deliveryDates,
+      departments: Array.isArray(source.departments) ? source.departments : state.departments,
+      orders: normalizeOrders(source.orders),
+      summaries: normalizeSummaries(source.summaries)
+    };
   }
 
   function fetchInitialData() {
-    if (state.orders.length === 0) {
-      state.orders = createInitialOrders();
-      refreshSummaries();
-    }
-
-    return mockDelay({
-      menus: state.menus,
-      deliveryDates: state.deliveryDates,
-      departments: state.departments,
-      orders: state.orders,
-      summaries: state.summaries
-    });
+    return callGasApi("initial").then(normalizeInitialData);
   }
 
   function submitOrder(orderPayload) {
-    const acceptedAt = nowLocalString();
-    const createdOrders = orderPayload.items.map((item) => {
-      const orderId = generateMockOrderId(orderPayload.deliveryDate);
-      return {
-        orderId,
-        acceptedAt,
-        deliveryDate: orderPayload.deliveryDate,
-        department: orderPayload.department,
-        applicantName: orderPayload.applicantName,
-        menuId: item.menuId,
-        menuName: item.menuName,
-        unitPrice: item.unitPrice,
-        quantity: item.quantity,
-        subtotal: item.subtotal,
-        status: "ACTIVE",
-        previousOrderId: "",
-        updatedAt: acceptedAt
-      };
-    });
-
-    state.orders = [...createdOrders, ...state.orders];
-    refreshSummaries();
-
-    return mockDelay({
-      ok: true,
-      orderIds: createdOrders.map((order) => order.orderId),
-      totalAmount: orderPayload.totalAmount,
-      acceptedAt
-    });
+    return callGasApi("order", orderPayload);
   }
 
   function submitChange(changePayload) {
-    const updatedAt = nowLocalString();
-    state.orders = state.orders.map((order) => {
-      if (order.orderId === changePayload.targetOrderId && order.status === "ACTIVE") {
-        return { ...order, status: "CHANGED", updatedAt };
-      }
-      return order;
-    });
-
-    const createdOrders = changePayload.items.map((item) => {
-      const orderId = generateMockOrderId(changePayload.newDeliveryDate);
-      return {
-        orderId,
-        acceptedAt: updatedAt,
-        deliveryDate: changePayload.newDeliveryDate,
-        department: changePayload.department,
-        applicantName: changePayload.applicantName,
-        menuId: item.menuId,
-        menuName: item.menuName,
-        unitPrice: item.unitPrice,
-        quantity: item.quantity,
-        subtotal: item.subtotal,
-        status: "ACTIVE",
-        previousOrderId: changePayload.targetOrderId,
-        updatedAt
-      };
-    });
-
-    state.orders = [...createdOrders, ...state.orders];
-    refreshSummaries();
-
-    return mockDelay({
-      ok: true,
-      orderIds: createdOrders.map((order) => order.orderId),
-      totalAmount: changePayload.totalAmount,
-      acceptedAt: updatedAt
-    });
+    return callGasApi("change", changePayload);
   }
 
   function submitCancel(cancelPayload) {
-    const updatedAt = nowLocalString();
-    let changed = false;
-
-    state.orders = state.orders.map((order) => {
-      if (order.orderId === cancelPayload.targetOrderId && order.status === "ACTIVE") {
-        changed = true;
-        return { ...order, status: "CANCELED", updatedAt };
-      }
-      return order;
-    });
-
-    refreshSummaries();
-
-    return mockDelay({
-      ok: true,
-      canceledOrderId: cancelPayload.targetOrderId,
-      changed,
-      acceptedAt: updatedAt
-    });
+    return callGasApi("cancel", cancelPayload);
   }
 
   function fetchOrders() {
-    return mockDelay(state.orders);
+    return callGasApi("orders").then(normalizeOrders);
   }
 
   function fetchSummaries() {
-    refreshSummaries();
-    return mockDelay(state.summaries);
+    return callGasApi("summaries").then(normalizeSummaries);
   }
 
   window.BentoApi = {
