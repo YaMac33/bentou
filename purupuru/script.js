@@ -1,4 +1,4 @@
-const GAS_URL = "https://script.google.com/macros/s/AKfycbxWwMt6cXdXu1KG3NFmzT10n9FX8VNI6dpmFS_WtDayCjG1eJe7Q1g1sXRg9AM7UsWs/exec";
+const GAS_URL = "https://script.google.com/macros/s/AKfycbwa74ykgIB9_pQfijFBU8Gur38XA171dOYZVw96UW8k6aTKMvGTzicTG-xXxn5PpHWT/exec";
 const MASTER_DATA_URL = "./data/masters.json";
 
 let MENU_ITEMS = [];
@@ -104,6 +104,19 @@ function getMenuVariants(menuItem) {
 function toNumber(value, defaultValue) {
   const number = Number(value);
   return Number.isFinite(number) ? number : defaultValue;
+}
+
+function toBooleanValue(value, defaultValue) {
+  if (value === undefined || value === null || value === "") {
+    return defaultValue;
+  }
+
+  if (value === true || value === false) {
+    return value;
+  }
+
+  const text = String(value).trim().toUpperCase();
+  return text === "TRUE" || text === "1" || text === "YES" || text === "有効" || text === "表示";
 }
 
 function formatQuantity(quantity) {
@@ -396,6 +409,57 @@ function assertApiPayload(payload) {
   return payload;
 }
 
+function parseJsonValue(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return value;
+  }
+}
+
+function getMenuSourceFromPayload(payload) {
+  const parsedPayload = parseJsonValue(payload);
+
+  if (Array.isArray(parsedPayload)) {
+    return parsedPayload;
+  }
+
+  if (!parsedPayload || typeof parsedPayload !== "object") {
+    return null;
+  }
+
+  const parsedMenus = parseJsonValue(parsedPayload.menus);
+  if (Array.isArray(parsedMenus)) {
+    return parsedMenus;
+  }
+
+  const parsedData = parseJsonValue(parsedPayload.data);
+  if (Array.isArray(parsedData)) {
+    return parsedData;
+  }
+
+  if (parsedData && typeof parsedData === "object") {
+    const nestedMenus = parseJsonValue(parsedData.menus);
+    if (Array.isArray(nestedMenus)) {
+      return nestedMenus;
+    }
+  }
+
+  return null;
+}
+
+function assertMenuPayload(payload) {
+  if (!Array.isArray(getMenuSourceFromPayload(payload))) {
+    throw new Error("menus が配列ではありません。");
+  }
+
+  return payload;
+}
+
 function normalizeMenuOption(row) {
   if (Array.isArray(row)) {
     return {
@@ -435,6 +499,78 @@ function normalizeMenuGroup(row) {
     groupSort: toNumber(row.groupSort ?? row.groupSortOrder ?? row["グループ並び順"], 0),
     options
   };
+}
+
+function normalizeFlatMenuRow(row) {
+  if (Array.isArray(row)) {
+    const menuName = String(row[0] || "").trim();
+
+    if (menuName === "メニュー") {
+      return null;
+    }
+
+    return {
+      menuName,
+      size: String(row[1] || "").trim(),
+      price: toNumber(row[2], 0),
+      visible: toBooleanValue(row[3], true),
+      sort: toNumber(row[4], 0),
+      groupSort: toNumber(row[5], 0)
+    };
+  }
+
+  const menuName = String(row.menuName || row.name || row.menu || row["メニュー"] || "").trim();
+  const size = String(row.size || row.sizeName || row["盛り方"] || "").trim();
+
+  return {
+    menuName,
+    size,
+    price: toNumber(row.price ?? row["単価"], 0),
+    visible: toBooleanValue(row.visible ?? row["表示"], true),
+    sort: toNumber(row.sort ?? row.order ?? row["並び順"], 0),
+    groupSort: toNumber(row.groupSort ?? row.groupSortOrder ?? row["グループ並び順"], 0)
+  };
+}
+
+function buildMenuItemsFromSource(menuSource) {
+  const groupedMenus = menuSource
+    .map(normalizeMenuGroup)
+    .filter((item) => item.menuName && item.options.length > 0);
+
+  if (groupedMenus.length > 0) {
+    return groupedMenus.sort((a, b) => a.groupSort - b.groupSort);
+  }
+
+  const groupMap = new Map();
+
+  menuSource
+    .map(normalizeFlatMenuRow)
+    .filter((row) => row && row.visible && row.menuName && row.size)
+    .forEach((row) => {
+      if (!groupMap.has(row.menuName)) {
+        groupMap.set(row.menuName, {
+          menuName: row.menuName,
+          name: row.menuName,
+          groupSort: row.groupSort,
+          options: []
+        });
+      }
+
+      const group = groupMap.get(row.menuName);
+      group.groupSort = row.groupSort;
+      group.options.push({
+        size: row.size,
+        price: row.price,
+        sort: row.sort
+      });
+    });
+
+  return Array.from(groupMap.values())
+    .map((group) => ({
+      ...group,
+      options: group.options.sort((a, b) => a.sort - b.sort)
+    }))
+    .sort((a, b) => a.groupSort - b.groupSort);
 }
 
 async function fetchMasterDataPayload() {
@@ -492,7 +628,7 @@ async function fetchJsonPayload(url) {
     throw new Error(url + " HTTP status: " + response.status);
   }
 
-  return assertApiPayload(await response.json());
+  return assertMenuPayload(assertApiPayload(await response.json()));
 }
 
 function fetchJsonpPayload(url) {
@@ -514,7 +650,7 @@ function fetchJsonpPayload(url) {
     window[callbackName] = (payload) => {
       try {
         cleanup();
-        resolve(assertApiPayload(payload));
+        resolve(assertMenuPayload(assertApiPayload(payload)));
       } catch (error) {
         reject(error);
       }
@@ -533,17 +669,17 @@ function fetchJsonpPayload(url) {
 async function loadMasterData() {
   try {
     const payload = await fetchMasterDataPayload();
-    const root = payload.data || payload;
-    const menuSource = root.menus;
+    const menuSource = getMenuSourceFromPayload(payload);
 
     if (!Array.isArray(menuSource)) {
       throw new Error("menus が配列ではありません。");
     }
 
-    const menus = menuSource
-      .map(normalizeMenuGroup)
-      .filter((item) => item.menuName && item.options.length > 0)
-      .sort((a, b) => a.groupSort - b.groupSort);
+    const menus = buildMenuItemsFromSource(menuSource);
+
+    if (menus.length === 0) {
+      throw new Error("表示できるメニューがありません。");
+    }
 
     MENU_ITEMS = menus;
   } catch (error) {
