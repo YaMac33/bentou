@@ -491,13 +491,15 @@
         scrollToBottom();
         updateLastUpdated();
 
-        await supabaseClient.functions.invoke('notify-slack', {
+        const { data: slackData, error: slackError } = await supabaseClient.functions.invoke('notify-slack', {
   body: {
     display_name: data.display_name,
     message: data.message,
     created_at: data.created_at
   }
 });
+
+console.log('Slack通知結果', { slackData, slackError });
 
         showNotice('投稿しました。', false);
 
